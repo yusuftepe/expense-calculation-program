@@ -1,0 +1,11 @@
+Flask
+Werkzeug
+python-dotenv
+Pillow
+opencv-python
+pytesseract
+pandas
+numpy
+matplotlib
+plotly
+pytest

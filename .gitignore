@@ -1,0 +1,29 @@
+# Uploaded receipt images
+uploads/*
+!uploads/.gitkeep
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Environment variables
+.env
+.env.*
+
+# Databases
+*.db
+*.sqlite3
+
+# IDEs and Editors
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
