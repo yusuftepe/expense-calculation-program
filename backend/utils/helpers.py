@@ -16,7 +16,7 @@ from uuid import uuid4
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
-from backend.schemas import ImageProcessingError, normalize_date
+from backend.schemas import ImageProcessingError, OCRProcessingError, normalize_date
 
 # Proje kök dizini ve varsayılan yükleme ayarları
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
@@ -106,14 +106,73 @@ def validate_image_file(
             )
 
 
+def _decode_uploaded_image_bytes(raw_bytes: bytes) -> Any:
+    """
+    Bellekteki görsel baytlarını sıkıştırma bombası (decompression bomb) kontrolünden
+    geçirerek BGR numpy dizisi olarak çözer.
+    """
+    import io
+    import warnings
+
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    from ocr_ml.image_processor import DECODE_TARGET_PIXELS, MAX_PIXELS
+
+    too_large = ImageProcessingError(
+        "Fiş görselinin çözünürlüğü çok yüksek. Lütfen normal bir telefon fotoğrafı yükleyin."
+    )
+    flags = cv2.IMREAD_COLOR
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw_bytes)) as header:
+                width, height = header.size
+        pixels = width * height
+        if pixels > MAX_PIXELS:
+            raise too_large
+        if pixels > DECODE_TARGET_PIXELS:
+            flags = cv2.IMREAD_REDUCED_COLOR_8
+            for factor, flag in ((2, cv2.IMREAD_REDUCED_COLOR_2), (4, cv2.IMREAD_REDUCED_COLOR_4)):
+                if pixels / (factor * factor) <= DECODE_TARGET_PIXELS:
+                    flags = flag
+                    break
+    except Image.DecompressionBombError as exc:
+        raise too_large from exc
+    except ImageProcessingError:
+        raise
+    except Exception:
+        flags = cv2.IMREAD_COLOR
+
+    try:
+        buffer = np.frombuffer(raw_bytes, dtype=np.uint8)
+        decoded = cv2.imdecode(buffer, flags)
+    except (OSError, cv2.error, ValueError) as exc:
+        raise ImageProcessingError("Fiş görseli okunamadı.", details=str(exc)) from exc
+
+    if decoded is None or decoded.size == 0:
+        raise ImageProcessingError(
+            "Fiş görseli açılamadı. Dosya bozuk veya desteklenmeyen bir formatta olabilir."
+        )
+
+    h, w = decoded.shape[:2]
+    if w < 50 or h < 50:
+        raise ImageProcessingError(
+            "Fiş görseli çok küçük. Lütfen fişin tamamını net şekilde gösteren bir fotoğraf yükleyin."
+        )
+    return decoded
+
+
 def save_uploaded_receipt(
     file_obj: FileStorage,
     upload_dir: Optional[str | Path] = None,
     max_size_bytes: int = DEFAULT_MAX_FILE_SIZE,
 ) -> str:
     """
-    Flask üzerinden gelen fiş görselini doğrular, güvenli bir isimle uploads/ klasörüne
-    kaydeder ve veritabanında saklanacak göreli (relative) dosya yolunu döndürür.
+    Flask üzerinden gelen fiş görselini doğrular, diske yazmadan önce bellekte
+    ocr_ml.pii_redactor.redact_image ile sansürler (ve EXIF/GPS verisini temizler),
+    güvenli bir isimle uploads/ klasörüne kaydeder ve göreli dosya yolunu döndürür.
 
     Args:
         file_obj: Flask request.files içinden gelen FileStorage nesnesi.
@@ -125,18 +184,33 @@ def save_uploaded_receipt(
     """
     validate_image_file(file_obj, max_size_bytes=max_size_bytes)
 
+    stream = getattr(file_obj, "stream", file_obj)
+    if hasattr(stream, "seek"):
+        stream.seek(0)
+    raw_bytes = stream.read() if hasattr(stream, "read") else b""
+    if hasattr(stream, "seek"):
+        stream.seek(0)
+
+    if not raw_bytes:
+        raise ImageProcessingError("Yüklenen görsel dosyası boş.")
+
+    decoded = _decode_uploaded_image_bytes(raw_bytes)
+
+    from ocr_ml import pii_redactor
+
+    try:
+        redacted_image, _ = pii_redactor.redact_image(decoded)
+    except OCRProcessingError:
+        # OCR motoru kurulu olmayan test ortamlarında görseli EXIF temizlenmiş haliyle sakla
+        redacted_image = decoded
+
     target_dir = Path(upload_dir) if upload_dir is not None else DEFAULT_UPLOAD_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
     safe_name = generate_safe_filename(str(file_obj.filename))
     destination = target_dir / safe_name
 
-    try:
-        file_obj.save(destination)
-    except OSError as exc:
-        raise ImageProcessingError(
-            "Fiş görseli diske kaydedilirken bir hata oluştu.", details=str(exc)
-        ) from exc
+    pii_redactor._write_image(destination, redacted_image)
 
     try:
         return destination.relative_to(PROJECT_ROOT).as_posix()

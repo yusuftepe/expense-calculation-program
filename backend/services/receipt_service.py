@@ -123,6 +123,8 @@ def _run_ocr_ml_pipeline(resolved_image: Path, relative_path: str) -> dict[str, 
                 raise ReceiptValidationError(str(err_msg))
             if "data" in validation_res and isinstance(validation_res["data"], dict):
                 parsed_data = validation_res["data"]
+            if "warnings" in validation_res and isinstance(validation_res["warnings"], list):
+                parsed_data["warnings"] = validation_res["warnings"]
 
     parsed_data["image_path"] = relative_path
     return parsed_data
@@ -149,6 +151,10 @@ def scan_receipt(image_path: str) -> dict[str, Any]:
 
     raw_receipt = _run_ocr_ml_pipeline(resolved, rel_path)
     validated_receipt = validate_receipt_payload(raw_receipt)
+    if isinstance(raw_receipt.get("warnings"), list):
+        validated_receipt["warnings"] = [
+            str(w).strip() for w in raw_receipt["warnings"] if str(w).strip()
+        ]
     return validated_receipt
 
 

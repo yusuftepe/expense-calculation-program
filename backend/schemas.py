@@ -277,6 +277,7 @@ class ReceiptSchema:
     items: list[ReceiptItemSchema] = field(default_factory=list)
     image_path: Optional[str] = None
     id: Optional[int] = None
+    warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.merchant = str(self.merchant or "").strip()
@@ -298,6 +299,11 @@ class ReceiptSchema:
             else:
                 raise ReceiptValidationError("Fiş ürünleri geçerli bir formatta değil.")
         self.items = normalized_items
+
+        if isinstance(self.warnings, (list, tuple)):
+            self.warnings = [str(w).strip() for w in self.warnings if str(w).strip()]
+        else:
+            self.warnings = []
 
     @property
     def primary_category(self) -> str:
@@ -326,6 +332,7 @@ class ReceiptSchema:
             "category": self.primary_category,
             "image_path": self.image_path,
             "items": [item.to_dict() for item in self.items],
+            "warnings": list(self.warnings),
         }
         if self.id is not None:
             data["id"] = self.id
@@ -340,6 +347,8 @@ class ReceiptSchema:
         raw_date = data.get("date") or data.get("receipt_date") or ""
         raw_total = data.get("total") if data.get("total") is not None else data.get("total_amount")
         raw_items = data.get("items") or []
+        raw_warnings = data.get("warnings")
+        warnings_list = list(raw_warnings) if isinstance(raw_warnings, (list, tuple)) else []
 
         return cls(
             id=data.get("id"),
@@ -351,6 +360,7 @@ class ReceiptSchema:
                 for item in raw_items
             ],
             image_path=data.get("image_path"),
+            warnings=warnings_list,
         )
 
 

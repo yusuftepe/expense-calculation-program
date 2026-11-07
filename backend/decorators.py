@@ -41,7 +41,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 def _wants_json_response() -> bool:
     """İsteğin bir API/JSON yanıtı bekleyip beklemediğini belirler."""
-    if request.path.startswith("/api/") or request.is_json:
+    if request.path.startswith("/api/") or request.is_json or request.args.get("format") == "json":
         return True
     accept_header = request.headers.get("Accept", "")
     return "application/json" in accept_header and "text/html" not in accept_header

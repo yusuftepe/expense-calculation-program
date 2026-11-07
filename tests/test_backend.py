@@ -40,7 +40,12 @@ from backend.services.receipt_service import (
     get_receipt_details,
     scan_receipt,
 )
-from backend.utils.helpers import allowed_file, format_currency, generate_safe_filename
+from backend.utils.helpers import (
+    allowed_file,
+    format_currency,
+    generate_safe_filename,
+    save_uploaded_receipt,
+)
 
 
 @pytest.fixture()
@@ -99,12 +104,13 @@ def test_expense_schema_validation() -> None:
 
 
 def test_receipt_schema_and_primary_category() -> None:
-    """Fiş şeması kalemleri doğrulamalı ve baskın kategoriyi doğru hesaplamalı."""
+    """Fiş şeması kalemleri doğrulamalı, baskın kategoriyi hesaplamalı ve warnings listesini korumalı."""
     receipt = validate_receipt_payload(
         {
             "merchant": "Migros",
             "date": "06/11/2026",
             "total": 850.0,
+            "warnings": ["Ürün tutarlarının toplamı genel toplamla uyuşmuyor."],
             "items": [
                 {"name": "Süt", "quantity": 2, "unit_price": 45.0, "category": "Gıda", "confidence": 0.96},
                 {"name": "Deterjan", "quantity": 1, "unit_price": 760.0, "category": "Temizlik", "confidence": 0.91},
@@ -114,6 +120,7 @@ def test_receipt_schema_and_primary_category() -> None:
     assert receipt["date"] == "2026-11-06"
     assert receipt["items"][0]["total_price"] == 90.0
     assert receipt["category"] == "Temizlik"  # 760 TL > 90 TL olduğu için baskın kategori Temizlik
+    assert receipt["warnings"] == ["Ürün tutarlarının toplamı genel toplamla uyuşmuyor."]
 
     with pytest.raises(ReceiptValidationError):
         validate_receipt_payload({"merchant": "", "date": "2026-11-06", "total": 100, "items": []})
@@ -233,8 +240,59 @@ def test_scraper_xml_parsing_and_currency_conversion() -> None:
 # 4. Flask Route / Entegrasyon Testleri (main.py)
 # ============================================================================
 
-def test_flask_expense_and_receipt_routes(unlocked_client, tmp_path: Path) -> None:
+def _make_pillow_receipt_bytes() -> io.BytesIO:
+    """Pillow ile gerçek bir sentetik fiş görseli (JPEG) üretir."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    lines = [
+        "MIGROS TICARET A.S.",
+        "TARIH : 06.11.2026",
+        "MAKARNA          *25,00",
+        "PEYNIR           *90,50",
+        "TOPLAM          *115,50",
+    ]
+    font = ImageFont.load_default(size=28)
+    image = Image.new("RGB", (640, 70 + len(lines) * 50), (240, 240, 240))
+    draw = ImageDraw.Draw(image)
+    for idx, text in enumerate(lines):
+        draw.text((30, 35 + idx * 50), text, fill=(20, 20, 20), font=font)
+
+    buf = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x010F] = "TestPhone"
+    image.save(buf, format="JPEG", quality=92, exif=exif)
+    buf.seek(0)
+    return buf
+
+
+def _ensure_ocr_available_or_stub(monkeypatch) -> None:
+    """RapidOCR veya Tesseract kurulu değilse OCR satır çıkarımını sentetik fişle taklit eder."""
+    from backend.schemas import OCRProcessingError
+    from ocr_ml import receipt_ocr, receipt_reader
+
+    if receipt_ocr.rapidocr_available():
+        return
+    try:
+        receipt_ocr.check_tesseract()
+        return
+    except OCRProcessingError:
+        pass
+
+    synthetic_lines = [
+        {"text": "MIGROS TICARET A.S.", "confidence": 0.96, "words": []},
+        {"text": "TARIH : 06.11.2026", "confidence": 0.95, "words": []},
+        {"text": "MAKARNA *25,00", "confidence": 0.94, "words": []},
+        {"text": "PEYNIR *90,50", "confidence": 0.93, "words": []},
+        {"text": "TOPLAM *115,50", "confidence": 0.97, "words": []},
+    ]
+    monkeypatch.setattr(receipt_ocr, "extract_lines_with_boxes", lambda *_a, **_kw: synthetic_lines)
+    monkeypatch.setattr(receipt_reader, "extract_lines_with_boxes", lambda *_a, **_kw: synthetic_lines)
+
+
+def test_flask_expense_and_receipt_routes(unlocked_client, tmp_path: Path, monkeypatch) -> None:
     """Flask üzerinden harcama ekleme, fiş tarama, fiş onaylama ve silme uçtan uca çalışmalı."""
+    _ensure_ocr_available_or_stub(monkeypatch)
+
     # 1. Manuel harcama ekle
     res_add = unlocked_client.post(
         "/expenses/add",
@@ -249,16 +307,26 @@ def test_flask_expense_and_receipt_routes(unlocked_client, tmp_path: Path) -> No
     assert res_add.status_code == 201
     expense_id = res_add.get_json()["expense_id"]
 
-    # 2. Fiş görseli yükleyerek /receipts/scan uç noktasını çağır
-    fake_image = io.BytesIO(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9")
+    # 2a. Bozuk sahte JPEG yüklemesi 400 (ImageProcessingError) ile reddedilmeli
+    corrupt_image = io.BytesIO(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9")
+    res_corrupt = unlocked_client.post(
+        "/receipts/scan?format=json",
+        data={"receipt": (corrupt_image, "bozuk_fis.jpg")},
+        content_type="multipart/form-data",
+    )
+    assert res_corrupt.status_code == 400
+
+    # 2b. Pillow ile üretilmiş geçerli fiş görseli yükleyerek /receipts/scan uç noktasını çağır
+    valid_image = _make_pillow_receipt_bytes()
     res_scan = unlocked_client.post(
         "/receipts/scan?format=json",
-        data={"receipt": (fake_image, "test_fis.jpg")},
+        data={"receipt": (valid_image, "test_fis.jpg")},
         content_type="multipart/form-data",
     )
     assert res_scan.status_code == 200
     scanned_receipt = res_scan.get_json()["receipt"]
     assert "merchant" in scanned_receipt and "items" in scanned_receipt
+    assert "warnings" in scanned_receipt and isinstance(scanned_receipt["warnings"], list)
 
     # 3. Taranan fiş henüz veritabanına kaydedilmemiş olmalı (toplam gider hâlâ 450.0 TL)
     res_before_confirm = unlocked_client.get("/api/analytics").get_json()
@@ -276,9 +344,62 @@ def test_flask_expense_and_receipt_routes(unlocked_client, tmp_path: Path) -> No
     res_del = unlocked_client.post(f"/expenses/delete/{expense_id}", json={})
     assert res_del.status_code == 200
 
-    # Test sırasında uploads/ içine kaydedilen geçici görseli temizle
+    # Test sırasında uploads/ içine kaydedilen geçici görseli temizle ve EXIF silindiğini doğrula
     saved_img_path = scanned_receipt.get("image_path")
     if saved_img_path:
         full_img = Path(__file__).resolve().parents[1] / saved_img_path
         if full_img.is_file():
+            from PIL import Image
+
+            assert not dict(Image.open(full_img).getexif())
             full_img.unlink()
+
+
+def test_scan_receipt_preserves_validator_warnings(tmp_path: Path, monkeypatch) -> None:
+    """validate_receipt tarafından üretilen warnings listesi scan_receipt çıktısında korunmalı."""
+    from ocr_ml import receipt_ocr, receipt_reader
+
+    mismatched_lines = [
+        {"text": "MIGROS TICARET A.S.", "confidence": 0.96, "words": []},
+        {"text": "TARIH : 06.11.2026", "confidence": 0.95, "words": []},
+        {"text": "MAKARNA *25,00", "confidence": 0.94, "words": []},
+        {"text": "TOPLAM *100,00", "confidence": 0.97, "words": []},
+    ]
+    monkeypatch.setattr(receipt_ocr, "extract_lines_with_boxes", lambda *_a, **_kw: mismatched_lines)
+    monkeypatch.setattr(receipt_reader, "extract_lines_with_boxes", lambda *_a, **_kw: mismatched_lines)
+
+    img_path = tmp_path / "uyari_fis.jpg"
+    img_path.write_bytes(_make_pillow_receipt_bytes().getvalue())
+
+    result = scan_receipt(str(img_path))
+    assert "warnings" in result
+    assert any("uyuşmuyor" in w for w in result["warnings"])
+
+
+def test_save_uploaded_receipt_redacts_before_writing_to_disk(tmp_path: Path, monkeypatch) -> None:
+    """save_uploaded_receipt görseli diske yazmadan önce ocr_ml.pii_redactor.redact_image ile sansürlemeli."""
+    import numpy as np
+    from werkzeug.datastructures import FileStorage
+    from ocr_ml import pii_redactor
+
+    called_before_disk_write = {"redacted": False}
+    original_redact = pii_redactor.redact_image
+
+    def spy_redact_image(image: np.ndarray):
+        # redact_image çağrıldığında hedef klasörde henüz hiçbir dosya yazılmamış olmalı
+        assert list(tmp_path.glob("receipt_*")) == []
+        called_before_disk_write["redacted"] = True
+        painted = image.copy()
+        painted[:10, :10] = 0
+        return painted, ["KART"]
+
+    monkeypatch.setattr(pii_redactor, "redact_image", spy_redact_image)
+
+    file_storage = FileStorage(
+        stream=_make_pillow_receipt_bytes(),
+        filename="kartli_fis.jpg",
+        content_type="image/jpeg",
+    )
+    saved_rel = save_uploaded_receipt(file_storage, upload_dir=tmp_path)
+    assert called_before_disk_write["redacted"] is True
+    assert Path(saved_rel).is_file() or (tmp_path / Path(saved_rel).name).is_file()

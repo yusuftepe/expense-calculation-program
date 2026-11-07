@@ -353,6 +353,8 @@ def create_app(test_config: Optional[dict[str, Any]] = None) -> Flask:
             )
 
         flash("Fiş okundu. Lütfen bilgileri kontrol edip onaylayın.", "info")
+        for warning_msg in scanned_data.get("warnings") or []:
+            flash(str(warning_msg), "warning")
         return _render_or_fallback(
             "receipt_scanner.html",
             "Fiş Tarama ve Kontrol",
