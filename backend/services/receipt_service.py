@@ -135,27 +135,46 @@ def _run_ocr_ml_pipeline(resolved_image: Path, relative_path: str) -> dict[str, 
 # ============================================================================
 
 @execution_timer
-def scan_receipt(image_path: str) -> dict[str, Any]:
+def scan_receipt(image_path: str | Path | Any) -> dict[str, Any]:
     """
-    OCR işlemini başlatır ve kullanıcı onay ekranında (receipt_scanner.html)
+    OCR işlemini başlatır ve kullanıcı onay ekranında (Streamlit veya HTML)
     gösterilmek üzere yapılandırılmış fiş verisini döndürür.
+
+    Hem kaydedilmiş dosya yolunu (str / Path) hem de doğrudan Streamlit
+    st.file_uploader (UploadedFile) / Flask (FileStorage) dosya nesnesini kabul eder.
 
     Altın Kural: OCR sonucu doğrudan veritabanına kaydedilmez; önce kullanıcı
     onayına sunulur.
     """
-    resolved = _resolve_image_path(image_path)
-    try:
-        rel_path = resolved.relative_to(PROJECT_ROOT).as_posix()
-    except ValueError:
-        rel_path = resolved.as_posix()
+    auto_saved_path: Optional[str] = None
+    if not isinstance(image_path, (str, Path)):
+        from backend.utils.helpers import remove_uploaded_file, save_uploaded_receipt
 
-    raw_receipt = _run_ocr_ml_pipeline(resolved, rel_path)
-    validated_receipt = validate_receipt_payload(raw_receipt)
-    if isinstance(raw_receipt.get("warnings"), list):
-        validated_receipt["warnings"] = [
-            str(w).strip() for w in raw_receipt["warnings"] if str(w).strip()
-        ]
-    return validated_receipt
+        auto_saved_path = save_uploaded_receipt(image_path)
+        target_path: str | Path = auto_saved_path
+    else:
+        target_path = image_path
+
+    try:
+        resolved = _resolve_image_path(target_path)
+        try:
+            rel_path = resolved.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            rel_path = resolved.as_posix()
+
+        raw_receipt = _run_ocr_ml_pipeline(resolved, rel_path)
+        validated_receipt = validate_receipt_payload(raw_receipt)
+        if isinstance(raw_receipt.get("warnings"), list):
+            validated_receipt["warnings"] = [
+                str(w).strip() for w in raw_receipt["warnings"] if str(w).strip()
+            ]
+        return validated_receipt
+    except Exception:
+        if auto_saved_path is not None:
+            from backend.utils.helpers import remove_uploaded_file
+
+            remove_uploaded_file(auto_saved_path)
+        raise
 
 
 # ============================================================================

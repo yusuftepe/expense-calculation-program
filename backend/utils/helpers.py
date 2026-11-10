@@ -69,41 +69,77 @@ def generate_safe_filename(original_filename: str, prefix: str = "receipt") -> s
     return f"{prefix}_{timestamp}_{unique_suffix}{ext}"
 
 
+def _extract_filename(
+    file_obj: Any,
+    fallback_filename: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Hem Flask FileStorage ('.filename'), hem Streamlit UploadedFile / standart dosya
+    nesneleri ('.name'), hem de doğrudan dosya yolu (str/Path) üzerinden dosya adını çözer.
+    """
+    if fallback_filename and str(fallback_filename).strip():
+        return str(fallback_filename).strip()
+
+    for attr in ("filename", "name"):
+        val = getattr(file_obj, attr, None)
+        if isinstance(val, str) and val.strip():
+            return Path(val.strip()).name
+
+    if isinstance(file_obj, (str, Path)) and str(file_obj).strip():
+        return Path(file_obj).name
+
+    return None
+
+
 def validate_image_file(
-    file_obj: FileStorage | BinaryIO | Any,
+    file_obj: FileStorage | BinaryIO | bytes | str | Path | Any,
     max_size_bytes: int = DEFAULT_MAX_FILE_SIZE,
+    filename: Optional[str] = None,
 ) -> None:
     """
     Yüklenen fiş görselinin varlığını, uzantısını ve dosya boyutunu doğrular.
+    Hem Flask FileStorage hem de Streamlit UploadedFile nesneleriyle uyumludur.
     Geçersiz durumda ImageProcessingError fırlatır.
     """
     if file_obj is None:
         raise ImageProcessingError("Yüklenecek fiş görseli bulunamadı.")
 
-    filename = getattr(file_obj, "filename", None)
-    if not filename or not str(filename).strip():
+    resolved_filename = _extract_filename(file_obj, fallback_filename=filename)
+    if not resolved_filename:
         raise ImageProcessingError("Lütfen geçerli bir fiş fotoğrafı seçin.")
 
-    if not allowed_file(str(filename)):
+    if not allowed_file(resolved_filename):
         raise ImageProcessingError(
-            f"Geçersiz dosya formatı ('{filename}'). Lütfen JPG, PNG veya WEBP formatında bir görsel yükleyin."
+            f"Geçersiz dosya formatı ('{resolved_filename}'). Lütfen JPG, PNG veya WEBP formatında bir görsel yükleyin."
         )
 
-    # Akış (stream) üzerinden boyut kontrolü yap ve imleci başa sar
-    stream = getattr(file_obj, "stream", file_obj)
-    if hasattr(stream, "seek") and hasattr(stream, "tell"):
-        current_pos = stream.tell()
-        stream.seek(0, os.SEEK_END)
-        file_size = stream.tell()
-        stream.seek(current_pos)
+    if isinstance(file_obj, (bytes, bytearray)):
+        file_size = len(file_obj)
+    elif isinstance(file_obj, (str, Path)):
+        candidate = Path(file_obj)
+        if not candidate.is_file():
+            raise ImageProcessingError(f"Fiş görseli bulunamadı: '{file_obj}'")
+        file_size = candidate.stat().st_size
+    else:
+        # Akış (stream) üzerinden boyut kontrolü yap ve imleci başa sar
+        stream = getattr(file_obj, "stream", file_obj)
+        if hasattr(stream, "seek") and hasattr(stream, "tell"):
+            current_pos = stream.tell()
+            stream.seek(0, os.SEEK_END)
+            file_size = stream.tell()
+            stream.seek(current_pos)
+        elif hasattr(file_obj, "size") and isinstance(getattr(file_obj, "size"), int):
+            file_size = int(getattr(file_obj, "size"))
+        else:
+            file_size = 1
 
-        if file_size <= 0:
-            raise ImageProcessingError("Yüklenen görsel dosyası boş.")
-        if file_size > max_size_bytes:
-            max_mb = round(max_size_bytes / (1024 * 1024), 1)
-            raise ImageProcessingError(
-                f"Dosya boyutu çok büyük. Maksimum izin verilen boyut: {max_mb} MB."
-            )
+    if file_size <= 0:
+        raise ImageProcessingError("Yüklenen görsel dosyası boş.")
+    if file_size > max_size_bytes:
+        max_mb = round(max_size_bytes / (1024 * 1024), 1)
+        raise ImageProcessingError(
+            f"Dosya boyutu çok büyük. Maksimum izin verilen boyut: {max_mb} MB."
+        )
 
 
 def _decode_uploaded_image_bytes(raw_bytes: bytes) -> Any:
@@ -165,31 +201,45 @@ def _decode_uploaded_image_bytes(raw_bytes: bytes) -> Any:
 
 
 def save_uploaded_receipt(
-    file_obj: FileStorage,
+    file_obj: FileStorage | BinaryIO | bytes | str | Path | Any,
     upload_dir: Optional[str | Path] = None,
     max_size_bytes: int = DEFAULT_MAX_FILE_SIZE,
+    filename: Optional[str] = None,
 ) -> str:
     """
-    Flask üzerinden gelen fiş görselini doğrular, diske yazmadan önce bellekte
+    Flask (FileStorage) veya Streamlit (st.file_uploader UploadedFile) üzerinden
+    gelen fiş görselini doğrular, diske yazmadan önce bellekte
     ocr_ml.pii_redactor.redact_image ile sansürler (ve EXIF/GPS verisini temizler),
     güvenli bir isimle uploads/ klasörüne kaydeder ve göreli dosya yolunu döndürür.
 
     Args:
-        file_obj: Flask request.files içinden gelen FileStorage nesnesi.
+        file_obj: Streamlit UploadedFile, Flask FileStorage, BytesIO, bytes veya dosya yolu.
         upload_dir: Kaydedilecek klasör yolu (varsayılan: proje kökündeki uploads/).
         max_size_bytes: İzin verilen maksimum dosya boyutu (byte).
+        filename: file_obj üzerinde dosya adı yoksa kullanılacak opsiyonel dosya adı.
 
     Returns:
         Kaydedilen dosyanın göreli yolu (örn. 'uploads/receipt_20261106_233030_a1b2c3d4.jpg').
     """
-    validate_image_file(file_obj, max_size_bytes=max_size_bytes)
+    validate_image_file(file_obj, max_size_bytes=max_size_bytes, filename=filename)
+    resolved_filename = _extract_filename(file_obj, fallback_filename=filename) or "receipt.jpg"
 
-    stream = getattr(file_obj, "stream", file_obj)
-    if hasattr(stream, "seek"):
-        stream.seek(0)
-    raw_bytes = stream.read() if hasattr(stream, "read") else b""
-    if hasattr(stream, "seek"):
-        stream.seek(0)
+    if isinstance(file_obj, (bytes, bytearray)):
+        raw_bytes = bytes(file_obj)
+    elif isinstance(file_obj, (str, Path)):
+        raw_bytes = Path(file_obj).read_bytes()
+    else:
+        stream = getattr(file_obj, "stream", file_obj)
+        if hasattr(stream, "seek"):
+            stream.seek(0)
+        if hasattr(stream, "read"):
+            raw_bytes = stream.read()
+        elif hasattr(file_obj, "getvalue"):
+            raw_bytes = file_obj.getvalue()
+        else:
+            raw_bytes = b""
+        if hasattr(stream, "seek"):
+            stream.seek(0)
 
     if not raw_bytes:
         raise ImageProcessingError("Yüklenen görsel dosyası boş.")
@@ -207,7 +257,7 @@ def save_uploaded_receipt(
     target_dir = Path(upload_dir) if upload_dir is not None else DEFAULT_UPLOAD_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = generate_safe_filename(str(file_obj.filename))
+    safe_name = generate_safe_filename(resolved_filename)
     destination = target_dir / safe_name
 
     pii_redactor._write_image(destination, redacted_image)

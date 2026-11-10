@@ -18,7 +18,10 @@ from backend.services.auth_service import (
     get_stored_password_hash,
     initialize_default_password,
     is_password_configured,
+    is_session_unlocked,
+    lock_session,
     reset_failed_attempts,
+    unlock_session,
     update_password,
     verify_password,
 )
@@ -131,3 +134,25 @@ def test_first_time_setup_and_login_logout_cycle(client) -> None:
     # 5. İlk belirlenen şifre ile tekrar giriş yapılabilmeli
     ok_login = client.post("/login", json={"password": "BenimGizliSifrem"})
     assert ok_login.status_code == 200
+
+
+def test_session_lock_unlock_without_flask_context() -> None:
+    """
+    Streamlit (st.session_state) veya bağımsız Python ortamında Flask request
+    context olmadan unlock_session, is_session_unlocked ve lock_session çalışmalı.
+    """
+    fake_streamlit_state: dict = {}
+    assert is_session_unlocked(session_store=fake_streamlit_state) is False
+
+    unlock_session(session_store=fake_streamlit_state)
+    assert is_session_unlocked(session_store=fake_streamlit_state) is True
+
+    lock_session(session_store=fake_streamlit_state)
+    assert is_session_unlocked(session_store=fake_streamlit_state) is False
+
+    # Parametresiz çağrıda da (bellek içi yedek depo ile) hata vermeden çalışmalı
+    lock_session()
+    assert is_session_unlocked() is False
+    unlock_session()
+    assert is_session_unlocked() is True
+    lock_session()

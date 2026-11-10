@@ -16,11 +16,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from collections.abc import MutableMapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
-from flask import session
+from flask import has_request_context, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from backend.schemas import AuthenticationError, DatabaseError
@@ -38,6 +39,37 @@ DEFAULT_SESSION_TIMEOUT_MINUTES: int = int(os.getenv("SESSION_TIMEOUT_MINUTES", 
 
 # Hatalı giriş denemelerini takip eden bellek içi (in-memory) durum sözlüğü
 _failed_attempts: dict[str, dict[str, float | int]] = {}
+
+# Flask veya Streamlit oturum bağlamı dışındaki çağrılar için bellek içi yedek oturum deposu
+_fallback_session_store: dict[str, Any] = {}
+
+
+def _get_session_store(
+    session_store: Optional[MutableMapping[str, Any]] = None,
+) -> MutableMapping[str, Any]:
+    """
+    Aktif çalışma ortamına göre uygun oturum (session) deposunu döndürür:
+    1. Açıkça verilen 'session_store' (örn. st.session_state veya test sözlüğü)
+    2. Aktif bir Flask HTTP isteği varsa 'flask.session'
+    3. Aktif bir Streamlit çalışma bağlamı varsa 'streamlit.session_state'
+    4. Aksi halde bellek içi '_fallback_session_store'
+    """
+    if session_store is not None:
+        return session_store
+
+    if has_request_context():
+        return session
+
+    try:
+        import streamlit as st  # type: ignore[import-not-found]
+        from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore[import-not-found]
+
+        if get_script_run_ctx() is not None:
+            return st.session_state
+    except Exception:
+        pass
+
+    return _fallback_session_store
 
 
 def _resolve_db_path(db_path: Optional[str | Path] = None) -> Path:
@@ -252,37 +284,47 @@ def update_password(
 
 
 # ============================================================================
-# 2. Flask Session (Oturum Açma, Kilitleme ve Hareketsizlik Kontrolü)
+# 2. Oturum Yönetimi (Flask Session & Streamlit st.session_state Uyumlu)
 # ============================================================================
 
-def unlock_session() -> None:
-    """Şifre doğrulandıktan sonra Flask oturumunun kilidini açar ve zaman damgasını günceller."""
-    session["unlocked"] = True
-    session["last_activity"] = time.time()
+def unlock_session(
+    session_store: Optional[MutableMapping[str, Any]] = None,
+) -> None:
+    """Şifre doğrulandıktan sonra oturumun kilidini açar ve zaman damgasını günceller."""
+    store = _get_session_store(session_store)
+    store["unlocked"] = True
+    store["last_activity"] = time.time()
 
 
-def lock_session() -> None:
+def lock_session(
+    session_store: Optional[MutableMapping[str, Any]] = None,
+) -> None:
     """Kullanıcı çıkış yaptığında veya süre dolduğunda uygulama oturumunu kilitler."""
-    session.pop("unlocked", None)
-    session.pop("last_activity", None)
+    store = _get_session_store(session_store)
+    store.pop("unlocked", None)
+    store.pop("last_activity", None)
 
 
-def is_session_unlocked(timeout_minutes: int = DEFAULT_SESSION_TIMEOUT_MINUTES) -> bool:
+def is_session_unlocked(
+    timeout_minutes: int = DEFAULT_SESSION_TIMEOUT_MINUTES,
+    session_store: Optional[MutableMapping[str, Any]] = None,
+) -> bool:
     """
     Oturumun açık olup olmadığını ve hareketsizlik süresinin (5-10 dk) aşılıp aşılmadığını
     kontrol eder. Süre aşılmışsa oturumu otomatik kilitler.
     """
-    if not session.get("unlocked"):
+    store = _get_session_store(session_store)
+    if not store.get("unlocked"):
         return False
 
-    last_activity = session.get("last_activity")
+    last_activity = store.get("last_activity")
     now = time.time()
 
     if last_activity is not None:
         elapsed_seconds = now - float(last_activity)
         if elapsed_seconds > (timeout_minutes * 60):
-            lock_session()
+            lock_session(session_store=store)
             return False
 
-    session["last_activity"] = now
+    store["last_activity"] = now
     return True

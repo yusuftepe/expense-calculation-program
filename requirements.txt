@@ -1,5 +1,6 @@
 Flask
 Werkzeug
+streamlit
 python-dotenv
 Pillow
 opencv-python-headless

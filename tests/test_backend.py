@@ -403,3 +403,27 @@ def test_save_uploaded_receipt_redacts_before_writing_to_disk(tmp_path: Path, mo
     saved_rel = save_uploaded_receipt(file_storage, upload_dir=tmp_path)
     assert called_before_disk_write["redacted"] is True
     assert Path(saved_rel).is_file() or (tmp_path / Path(saved_rel).name).is_file()
+
+
+def test_streamlit_uploaded_file_compatibility(tmp_path: Path, monkeypatch) -> None:
+    """
+    Streamlit st.file_uploader tarafından döndürülen UploadedFile benzeri
+    ('.filename' yerine '.name' özelliğine sahip BytesIO) nesneler hem
+    save_uploaded_receipt hem de scan_receipt ile doğrudan çalışmalı.
+    """
+    _ensure_ocr_available_or_stub(monkeypatch)
+
+    class DummyStreamlitUploadedFile(io.BytesIO):
+        def __init__(self, data: bytes, name: str) -> None:
+            super().__init__(data)
+            self.name = name
+            self.size = len(data)
+
+    raw_jpeg = _make_pillow_receipt_bytes().getvalue()
+    st_file = DummyStreamlitUploadedFile(raw_jpeg, name="streamlit_fis.jpg")
+
+    saved_path = save_uploaded_receipt(st_file, upload_dir=tmp_path)
+    assert saved_path.endswith(".jpg")
+
+    result = scan_receipt(saved_path)
+    assert "merchant" in result and "items" in result

@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Any, Callable, Optional, TypeVar
 
-from flask import flash, jsonify, redirect, request, url_for
+from flask import flash, has_request_context, jsonify, redirect, request, url_for
 
 from backend.schemas import (
     AppBaseError,
@@ -41,6 +41,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 def _wants_json_response() -> bool:
     """İsteğin bir API/JSON yanıtı bekleyip beklemediğini belirler."""
+    if not has_request_context():
+        return False
     if request.path.startswith("/api/") or request.is_json or request.args.get("format") == "json":
         return True
     accept_header = request.headers.get("Accept", "")
@@ -55,7 +57,8 @@ def login_required(func: F) -> F:
     """
     Korumalı sayfalara ve API uç noktalarına şifre girilmeden erişilmesini engeller.
     Hareketsizlik süresi (5-10 dk) dolmuşsa oturumu otomatik kilitleyip
-    kullanıcıyı '/login' ekranına yönlendirir.
+    Flask'ta '/login' ekranına yönlendirir, Streamlit/Python çağrılarında ise
+    AuthenticationError fırlatır.
     """
 
     @functools.wraps(func)
@@ -63,6 +66,12 @@ def login_required(func: F) -> F:
         from backend.services.auth_service import is_session_unlocked
 
         if not is_session_unlocked():
+            if not has_request_context():
+                logger.info("Kilitli oturum erişim denemesi engellendi: %s", func.__name__)
+                raise AuthenticationError(
+                    "Uygulama kilitli veya oturum süresi doldu. Lütfen şifrenizi girin."
+                )
+
             logger.info("Kilitli oturum erişim denemesi engellendi: %s", request.path)
             if _wants_json_response():
                 return (
@@ -154,7 +163,15 @@ def _format_error_response(
     status_code: int,
     redirect_endpoint: Optional[str] = None,
 ) -> Any:
-    """İstek türüne göre JSON yanıtı veya Flash mesajlı yönlendirme üretir."""
+    """İstek türüne göre JSON yanıtı, Flash mesajlı yönlendirme veya Python sözlüğü üretir."""
+    if not has_request_context():
+        return {
+            "status": "error",
+            "error_type": error_type,
+            "message": user_message,
+            "status_code": status_code,
+        }
+
     if _wants_json_response() or redirect_endpoint is None:
         return (
             jsonify(
